@@ -140,6 +140,25 @@ class Implementation(xapi.storage.api.volume.SR_skeleton):
     def probe(self, dbg, uri):
         raise AssertionError("not implemented")
 
+        # TODO: Complete implementation
+
+        if iqn == None:
+            targetMap = discoverIQN(dbg, target, usechap, username, password)
+            print_iqn_entries(targetMap)
+            # FIXME: Suppress backtrace in a better way
+            sys.tracebacklimit=0
+            raise xapi.storage.api.volume.Unimplemented(
+                  "Uri is missing target IQN information: %s" % uri)
+
+        if scsiid == None:
+            target_path = "/dev/iscsi/%s/%s:3260" % (iqn, target)
+            lunMap = discoverLuns(dbg, target_path)
+            print_lun_entries(lunMap)
+            # FIXME: Suppress backtrace in a better way
+            sys.tracebacklimit=0
+            raise xapi.storage.api.volume.Unimplemented(
+                  "Uri is missing LUN information: %s" % uri)
+
     def attach(self, dbg, uri):
         log.debug("%s: SR.attach: uri=%s" % (dbg, uri))
 

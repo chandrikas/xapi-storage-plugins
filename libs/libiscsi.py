@@ -14,8 +14,46 @@ import XenAPI
 import socket
 import scsiutil
 import xml.dom.minidom
+import fcntl
+
 
 DEFAULT_PORT = 3260
+ISCSI_REFDIR = '/var/run/sr-ref'
+RETRY_MAX = 20 # retries
+RETRY_PERIOD = 1.0 # seconds
+
+
+# TODO: File locking logic can be factored out into a util lib
+#Opens and locks a file, returns filehandle
+def lock_file(dbg, filename, mode="a+"):
+    try:
+        f = open(filename, mode)
+    except:
+        raise xapi.storage.api.volume.Unimplemented(
+                  "Couldn't open refcount file: %s" % filename)
+    retries = 0
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except IOError as e:
+            # raise on unrelated IOErrors
+            if e.errno != errno.EAGAIN:
+                raise
+
+        if retries >= RETRY_MAX:
+            raise xapi.storage.api.volume.Unimplemented(
+                  "Couldn't lock refcount file: %s" % filename)
+        time.sleep(RETRY_PERIOD)
+
+    return f
+
+
+#Unlocks and closes file
+def unlock_file(dbg, filehandle):
+    fcntl.flock(filehandle, fcntl.LOCK_UN)
+    filehandle.close()
+
 
 def print_lun_entries(map):
     dom = xml.dom.minidom.Document()
@@ -119,6 +157,7 @@ def print_iqn_entries(map):
         count += 1
     print >>sys.stderr,dom.toprettyxml()
 
+
 def parse_node_output(text):
     """helper function - parses the output of iscsiadm for discovery and
     get_node_records"""
@@ -169,39 +208,104 @@ def discoverIQN(dbg, target, usechap=False, username=None, password=None,
 
     return parse_node_output(stdout)
 
-def login(dbg, target, iqn, usechap=False, username=None, password=None):
-    cmd = ["/usr/sbin/iscsiadm", "-m", "discovery", "-t", "st", "-p", target]
-    output = call(dbg, cmd).split('\n')[0] 
+
+def set_chap_settings(dbg, portal, target, username, password):
+    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
+           portal, "--op", "update", "-n", "node.session.auth.authmethod", 
+           "-v", "CHAP"]
+    output = call(dbg, cmd)
+    log.debug("%s: output = %s" % (dbg, output))
+    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
+           portal, "--op", "update", "-n", "node.session.auth.username", 
+           "-v", username]
+    output = call(dbg, cmd)
+    log.debug("%s: output = %s" % (dbg, output))
+    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
+           portal, "--op", "update", "-n", "node.session.auth.password", 
+           "-v", password]
+    output = call(dbg, cmd)
+    log.debug("%s: output = %s" % (dbg, output))
+
+
+def login(dbg, uri, target, iqn, usechap=False, username=None, password=None):
+
+    iqn_map = discoverIQN(dbg, target, usechap, username, password)
+    output = iqn_map[0] 
     # FIXME: only take the first one returned. 
     # This might not always be the one we want.
     log.debug("%s: output = %s" % (dbg, output))
-    portal = output.split(' ')[0]
+    portal = output[0]
     # FIXME: error handling
 
-    # Provide authentication details if necessary
+   # Provide authentication details if necessary
     if usechap:
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-               portal, "--op", "update", "-n", "node.session.auth.authmethod", 
-               "-v", "CHAP"]
-        output = call(dbg, cmd)
-        log.debug("%s: output = %s" % (dbg, output))
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-               portal, "--op", "update", "-n", "node.session.auth.username", 
-               "-v", username]
-        output = call(dbg, cmd)
-        log.debug("%s: output = %s" % (dbg, output))
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-               portal, "--op", "update", "-n", "node.session.auth.password", 
-               "-v", password]
-        output = call(dbg, cmd)
-        log.debug("%s: output = %s" % (dbg, output))
+        set_chap_settings(dbg, portal, target, username, password)
 
-    # Log in
-    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, 
-           "--portal", portal, "-l"]
-    output = call(dbg, cmd)
-    log.debug("%s: output = %s" % (dbg, output))
-    # FIXME: check for success
+    # Lock refcount file before login
+    if not os.path.exists(ISCSI_REFDIR):
+        os.mkdir(ISCSI_REFDIR)
+    filename = os.path.join(ISCSI_REFDIR, iqn)
+
+    f = lock_file(dbg, filename, "a+")
+
+    current_sessions = listSessions(dbg)
+    log.debug("%s: current iSCSI sessions are %s" % (dbg, current_sessions))
+    sessionid = findMatchingSession(dbg, portal, iqn, current_sessions)
+    if sessionid:
+        # If there's an existing session, rescan it 
+        # in case new LUNs have appeared in it
+        log.debug("%s: rescanning session %d for %s on %s" % 
+                   (dbg, sessionid, iqn, target))
+        rescanSession(dbg, sessionid)
+    else:
+        # Otherwise, perform a fresh login
+        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, 
+               "--portal", portal, "-l"]
+        output = call(dbg, cmd)
+        log.debug("%s: output = %s" % (dbg, output))
+        # FIXME: check for success
+
+   # Increment refcount
+    found = False
+    for line in f.readlines():
+        if line.find(uri) != -1:
+            found = True
+    if not found:
+        f.write("%s\n" % uri)
+
+    unlock_file(dbg, f)
+
+    waitForDevice(dbg)
+
+
+def logout(dbg, uri, iqn):
+
+    #import sys
+    #if not sys.modules.has_key('rpdb2'):
+    #    import rpdb2; rpdb2.start_embedded_debugger("ciccio", fAllowUnencrypted = True, fAllowRemote = True)
+
+    filename = os.path.join(ISCSI_REFDIR, iqn)
+    if not os.path.exists(filename):
+        return 
+
+    f = lock_file(dbg, filename, "r+")
+
+    refcount = 0
+    file_content = f.readlines()
+    f.seek(0,0)
+    for line in file_content:
+        if line.find(uri) == -1:
+            f.write(line)
+            refcount += 1
+    f.truncate()
+
+    if not refcount:
+        os.unlink(filename)
+        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "-u"]
+        call(dbg, cmd)
+
+    unlock_file(dbg, f)
+        
 
 def waitForDevice(dbg):
     # Wait for new device(s) to appear
@@ -211,6 +315,7 @@ def waitForDevice(dbg):
     # FIXME: For some reason, udevadm settle isn't sufficient 
     # to ensure the device is present. Why not?
     time.sleep(10)
+
 
 def listSessions(dbg):
     '''Return a list of (sessionid, portal, targetIQN) pairs 
@@ -223,11 +328,11 @@ def listSessions(dbg):
     return [tuple([int(x.split(' ')[1].strip('[]')), x.split(' ')[2], 
             x.split(' ')[3]]) for x in output.split('\n') if x <> '']
 
-def findMatchingSession(dbg, target, iqn, sessions):
+def findMatchingSession(dbg, new_target, iqn, sessions):
     for (sessionid, portal, targetiqn) in sessions:
         # FIXME: only match on target IP address and IQN for now 
         # (not target port number)
-        if portal.startswith(target + ":") and targetiqn == iqn:
+        if portal.split(',')[0] == new_target and targetiqn == iqn:
             return sessionid
     return None
 
@@ -312,11 +417,14 @@ def decomposeISCSIuri(dbg, uri):
 def zoneInLUN(dbg, uri):
     log.debug("%s: zoneInLUN uri=%s" % (dbg, uri))
 
-
     u = urlparse.urlparse(uri)
     if u.scheme == 'iscsi':
         log.debug("%s: u = %s" % (dbg, u))
         (target, iqn, scsiid) = decomposeISCSIuri(dbg, u)
+        if not target or not iqn or not scsiid:
+            raise xapi.storage.api.volume.SR_does_not_exist(
+                  "The SR URI is invalid; please use \
+                   iscsi://<target>/<targetIQN>/<lun>")
         log.debug("%s: target = '%s', iqn = '%s', scsiid = '%s'" % 
                   (dbg, target, iqn, scsiid))
 
@@ -333,40 +441,10 @@ def zoneInLUN(dbg, uri):
 
         configureISCSIDaemon(dbg)
 
-        if iqn == None:
-            targetMap = discoverIQN(dbg, target, usechap, username, password)
-            print_iqn_entries(targetMap)
-            # FIXME: Suppress backtrace in a better way
-            sys.tracebacklimit=0
-            raise xapi.storage.api.volume.Unimplemented(
-                  "Uri is missing target IQN information: %s" % uri)
+        log.debug("%s: logging into %s on %s" % (dbg, iqn, target))
+        login(dbg, uri, target, iqn, usechap, username, password)
 
-        current_sessions = listSessions(dbg)
-        log.debug("%s: current iSCSI sessions are %s" % (dbg, current_sessions))
-        sessionid = findMatchingSession(dbg, target, iqn, current_sessions)
-        if sessionid:
-            # If there's an existing session, rescan it 
-            # in case new LUNs have appeared in it
-            log.debug("%s: rescanning session %d for %s on %s" % 
-                      (dbg, sessionid, iqn, target))
-            # FIXME: should do refcounting to avoid logging out on 
-            # first SR.detach
-            rescanSession(dbg, sessionid)
-        else:
-            # Otherwise, perform a fresh login
-            log.debug("%s: logging into %s on %s" % (dbg, iqn, target))
-            login(dbg, target, iqn, usechap, username, password)
 
-        waitForDevice(dbg)
-
-        if scsiid == None:
-            target_path = "/dev/iscsi/%s/%s:3260" % (iqn, target)
-            lunMap = discoverLuns(dbg, target_path)
-            print_lun_entries(lunMap)
-            # FIXME: Suppress backtrace in a better way
-            sys.tracebacklimit=0
-            raise xapi.storage.api.volume.Unimplemented(
-                  "Uri is missing LUN information: %s" % uri)
 
         dev_path = "/dev/disk/by-id/scsi-%s" % scsiid
     else:
@@ -396,5 +474,6 @@ def zoneOutLUN(dbg, uri):
         (target, iqn, scsiid) = decomposeISCSIuri(dbg, u)
         log.debug("%s: iqn = %s" % (dbg, iqn))
 
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "-u"]
-        call(dbg, cmd)
+        logout(dbg, uri, iqn)
+
+
