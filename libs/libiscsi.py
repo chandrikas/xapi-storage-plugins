@@ -156,8 +156,7 @@ def get_device_path(dbg, uri):
     return dev_path
 
 
-def login(dbg, uri, keys):
-
+def login(dbg, ref_str, keys):
     iqn_map = discoverIQN(dbg, keys)
     output = iqn_map[0] 
     # FIXME: only take the first one returned. 
@@ -198,10 +197,10 @@ def login(dbg, uri, keys):
    # Increment refcount
     found = False
     for line in f.readlines():
-        if line.find(uri) != -1:
+        if line.find(ref_str) != -1:
             found = True
     if not found:
-        f.write("%s\n" % uri)
+        f.write("%s\n" % ref_str)
 
     unlock_file(dbg, f)
     waitForDevice(dbg)
@@ -211,8 +210,7 @@ def login(dbg, uri, keys):
     return target_path
 
 
-def logout(dbg, uri, iqn):
-
+def logout(dbg, ref_str, iqn):
     filename = os.path.join(ISCSI_REFDIR, iqn)
     if not os.path.exists(filename):
         return 
@@ -223,7 +221,7 @@ def logout(dbg, uri, iqn):
     file_content = f.readlines()
     f.seek(0,0)
     for line in file_content:
-        if line.find(uri) == -1:
+        if line.find(ref_str) == -1:
             f.write(line)
             refcount += 1
     f.truncate()
@@ -257,6 +255,7 @@ def listSessions(dbg):
     return [tuple([int(x.split(' ')[1].strip('[]')), x.split(' ')[2], 
             x.split(' ')[3]]) for x in output.split('\n') if x <> '']
 
+
 def findMatchingSession(dbg, new_target, iqn, sessions):
     for (sessionid, portal, targetiqn) in sessions:
         # FIXME: only match on target IP address and IQN for now 
@@ -265,12 +264,14 @@ def findMatchingSession(dbg, new_target, iqn, sessions):
             return sessionid
     return None
 
+
 def rescanSession(dbg, sessionid):
     cmd = ["/usr/sbin/iscsiadm", "-m", "session", "-r", str(sessionid), 
            "--rescan"]
     output = call(dbg, cmd)
     log.debug("%s: output = '%s'" % (dbg, output))
     # FIXME: check for success
+
 
 def getDesiredInitiatorName(dbg):
     # FIXME: for now, get this from xapi. In future, xapi will 
@@ -297,11 +298,13 @@ def getCurrentInitiatorName(dbg):
 def restartISCSIDaemon(dbg):
     cmd = ["/usr/bin/systemctl", "restart", "iscsid"]
     call(dbg, cmd)
+
  
 def isISCSIDaemonRunning(dbg):
     cmd = ["/usr/bin/systemctl", "status", "iscsid"]
     (stdout, stderr, rc) = call(dbg, cmd, error=False, simple=False)
     return rc == 0
+
  
 def configureISCSIDaemon(dbg):
     # Find out what the user wants the IQN to be
@@ -321,6 +324,7 @@ def configureISCSIDaemon(dbg):
             else:
                 setInitiatorName(dbg, iqn)
                 restartISCSIDaemon(dbg)
+
 
 def decomposeISCSIuri(dbg, uri):
     if (uri.scheme != "iscsi"):
@@ -353,6 +357,7 @@ def decomposeISCSIuri(dbg, uri):
         keys['target'] = keys['target'][atindex+1:]
 
     return keys
+
 
 def zoneInLUN(dbg, uri):
     log.debug("%s: zoneInLUN uri=%s" % (dbg, uri))
@@ -397,6 +402,7 @@ def zoneInLUN(dbg, uri):
         fd.write("noop\n")
 
     return dev_path
+
 
 def zoneOutLUN(dbg, uri):
     log.debug("%s: zoneOutLUN uri=%s" % (dbg, uri))

@@ -20,14 +20,14 @@ import XenAPI
 # For a block device /a/b/c, we will mount it at <mountpoint_root>/a/b/c
 mountpoint_root = "/var/run/sr-mount/"
 
-def getSRpath(dbg, uri, check=True):
+def getSRMountPath(dbg, uri, check=True):
     dev_path = blkinfo.get_device_path(dbg, uri)
-    sr_path = os.path.abspath(mountpoint_root + dev_path)
+    mnt_path = os.path.abspath(mountpoint_root + dev_path)
 
     if check:
-        if not(os.path.isdir(sr_path)) or not(os.path.ismount(sr_path)):
-            raise xapi.storage.api.volume.Sr_not_attached(sr_path)
-    return sr_path
+        if not(os.path.isdir(mnt_path)) or not(os.path.ismount(mnt_path)):
+            raise xapi.storage.api.volume.Sr_not_attached(mnt_path)
+    return mnt_path
 
 def getVOLpath(dbg, sr_path, key, check=True):
     vol_dir  = os.path.join(sr_path, key)
@@ -147,48 +147,58 @@ class Implementation(xapi.storage.api.volume.SR_skeleton):
 
         if u.scheme == 'iscsi':
             object_map = []
+            # used for refcounting
+            probe_uuid = str(uuid.uuid4())
             keys = libiscsi.decomposeISCSIuri(dbg, u)
             if keys['target'] == None:
                 raise xapi.storage.api.volume.SR_does_not_exist(
                       "The SR URI is invalid")
-            # uri has target but no IQN information
-            # Return possible URI options by querying 
-            # the target for IQN information
             if keys['iqn'] == None:
+                # uri has target but no IQN information
+                # Return possible URI options by querying 
+                # the target for IQN information
                 iqn_map = libiscsi.discoverIQN(dbg, keys)
                 if len(iqn_map) == 0:
                     raise xapi.storage.api.volume.SR_does_not_exist(
                           "No IQNs available at target")
                 for record in iqn_map:
                     object_map.append(record[2])
-            # uri has target and IQN but no LUN information
-            # Return possible URI options by querying 
-            # the target for LUN information
             elif keys['scsiid'] == None:
+                # uri has target and IQN but no LUN information
+                # Return possible URI options by querying 
+                # the target for LUN information
                 try:
-                    target_path = libiscsi.login(dbg, uri, keys)
+                    target_path = libiscsi.login(dbg, probe_uuid, keys)
                     lun_map = libiscsi.discoverLuns(dbg, target_path)
                 finally: 
-                    libiscsi.logout(dbg, uri, keys['iqn'])
+                    libiscsi.logout(dbg, probe_uuid, keys['iqn'])
                 if len(lun_map) == 0:
                     raise xapi.storage.api.volume.SR_does_not_exist(
                           "No LUNs available at targetIQN")
                 for record in lun_map:
                     object_map.append(record[4])
-            # URI is complete. Find out if the underlying                
-            # device is formatted using GFS2.
             else: 
+                # URI is complete. Find out if the underlying                
+                # device is formatted using GFS2.
                 try: 
-                    libiscsi.login(dbg, uri, keys)
+                    libiscsi.login(dbg, probe_uuid, keys)
                     dev_path = blkinfo.get_device_path(dbg, uri)
                     if blkinfo.get_format(dbg, dev_path) == "gfs2":
-                        # Check if sr_path needs to be mounted
-                        mnt_path = mount_local(dbg, dev_path)
-                        srs.append(self.stat(dbg, uri))
-                        # Unmount only if we mounted
-                        umount(dbg, mnt_path)
+                        mount = False
+                        try: 
+                            mnt_path = getSRMountPath(dbg, uri)
+                        except:
+                            #mount path doesn't exist
+                            mount = True
+                            mnt_path = mount_local(dbg, dev_path)
+                        # stat takes sr_path which is 
+                        # file://<mnt_path>
+                        sr_path = "file://%s" % mnt_path
+                        srs.append(self.stat(dbg, sr_path))
+                        if mount == True:
+                            umount(dbg, mnt_path)
                 finally: 
-                    libiscsi.logout(dbg, uri, keys['iqn'])
+                    libiscsi.logout(dbg, probe_uuid, keys['iqn'])
                     
             if len(object_map):
                 for obj in object_map: 
@@ -198,9 +208,19 @@ class Implementation(xapi.storage.api.volume.SR_skeleton):
             #HBA transport
             dev_path = blkinfo.get_device_path(dbg, uri)
             if blkinfo.get_format(dbg, dev_path) == "gfs2":
-                mnt_path = mount_local(dbg, dev_path)
-                srs.append(self.stat(dbg, uri))
-                umount(dbg, mnt_path)
+                mount = False
+                try: 
+                    mnt_path = getSRMountPath(dbg, uri)
+                except:
+                    #mount path doesn't exist
+                    mount = True
+                    mnt_path = mount_local(dbg, dev_path)
+                # stat takes sr_path which is 
+                # file://<mnt_path>
+                sr_path = "file://%s" % mnt_path
+                srs.append(self.stat(dbg, sr_path))
+                if mount == True:
+                    umount(dbg, mnt_path)
 
         return {
             "srs": srs,
@@ -336,8 +356,8 @@ class Implementation(xapi.storage.api.volume.SR_skeleton):
         libvhd.stopGC(dbg, "gfs2", sr)
 
         # Unmount the FS
-        sr_path = getSRpath(dbg, uri)
-        umount(dbg, sr_path)
+        mnt_path = getSRMountPath(dbg, uri)
+        umount(dbg, mnt_path)
 
         # Unplug device if need be
         unplug_device(dbg, uri)
@@ -347,9 +367,16 @@ class Implementation(xapi.storage.api.volume.SR_skeleton):
         return libvhd.ls(dbg, sr, gfs2.Callbacks())
 
     def stat(self, dbg, sr):
-        uri = getFromSRMetadata(dbg, sr, 'uri')
+        # SR path (sr) is file://<mnt_path>
+        # Get mnt_path by dropping url scheme
+        uri = urlparse.urlparse(sr)
+        mnt_path = "/%s/%s" % (uri.netloc, uri.path)
+
+        if not(os.path.isdir(mnt_path)) or not(os.path.ismount(mnt_path)):
+            raise xapi.storage.api.volume.Sr_not_attached(mnt_path)
+
         # Get the filesystem size
-        statvfs = os.statvfs(getSRpath(dbg, uri))
+        statvfs = os.statvfs(mnt_path)
         psize = statvfs.f_blocks * statvfs.f_frsize
         fsize = statvfs.f_bfree * statvfs.f_frsize
         log.debug("%s: statvfs says psize = %Ld" % (dbg, psize))
